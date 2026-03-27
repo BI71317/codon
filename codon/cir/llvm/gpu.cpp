@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "codon/cir/llvm/optimize.h"
 #include "codon/util/common.h"
@@ -689,6 +691,310 @@ void exploreGV(llvm::GlobalValue *G, llvm::SmallPtrSetImpl<llvm::GlobalValue *> 
   }
 }
 
+using LocalEnv = std::unordered_map<const llvm::Value *, llvm::Constant *>;
+
+struct GlobalCaptureContext {
+  llvm::Function *main = nullptr;
+  std::unordered_map<llvm::GlobalVariable *, llvm::StoreInst *> initStores;
+  std::unordered_map<llvm::GlobalVariable *, llvm::Constant *> cache;
+  std::unordered_set<llvm::GlobalVariable *> visiting;
+};
+
+llvm::Function *findTopLevelMain(llvm::Module *M) {
+  if (auto *F = M->getFunction("main.0"))
+    return F;
+  for (auto &F : *M) {
+    if (!F.isDeclaration() && F.getName().starts_with("main."))
+      return &F;
+  }
+  return nullptr;
+}
+
+llvm::StoreInst *findUniqueGlobalInitStore(llvm::Function *F, llvm::GlobalVariable *GV) {
+  llvm::StoreInst *found = nullptr;
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
+      if (!SI)
+        continue;
+      auto *ptr = SI->getPointerOperand()->stripPointerCasts();
+      if (ptr != GV)
+        continue;
+      if (found)
+        return nullptr;
+      found = SI;
+    }
+  }
+  return found;
+}
+
+llvm::Constant *captureValue(llvm::Value *V, LocalEnv &env, GlobalCaptureContext &ctx);
+
+bool buildLocalEnvUntil(llvm::Function *F, llvm::Instruction *stop, LocalEnv &env,
+                        GlobalCaptureContext &ctx) {
+  llvm::BasicBlock *BB = &F->getEntryBlock();
+  llvm::SmallPtrSet<llvm::BasicBlock *, 8> visited;
+
+  while (BB) {
+    if (!visited.insert(BB).second)
+      return false;
+
+    for (auto &I : *BB) {
+      if (&I == stop)
+        return true;
+
+      if (llvm::isa<llvm::AllocaInst>(&I)) {
+        env[&I] = nullptr;
+        continue;
+      }
+
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        auto *ptr = SI->getPointerOperand()->stripPointerCasts();
+        if (!llvm::isa<llvm::AllocaInst>(ptr))
+          continue;
+        auto *val = captureValue(SI->getValueOperand(), env, ctx);
+        if (!val)
+          return false;
+        env[ptr] = val;
+        continue;
+      }
+
+      if (auto *BI = llvm::dyn_cast<llvm::BranchInst>(&I)) {
+        if (!BI->isUnconditional())
+          return false;
+        BB = BI->getSuccessor(0);
+        goto next_block;
+      }
+
+      if (llvm::isa<llvm::ReturnInst>(&I))
+        return false;
+    }
+
+    return false;
+  next_block:;
+  }
+
+  return false;
+}
+
+llvm::Constant *captureFunctionReturn(llvm::Function *F,
+                                      const std::vector<llvm::Constant *> &args,
+                                      GlobalCaptureContext &ctx) {
+  if (!F || F->isDeclaration() || F->arg_size() != args.size())
+    return nullptr;
+
+  LocalEnv env;
+  size_t idx = 0;
+  for (auto &arg : F->args())
+    env[&arg] = args[idx++];
+
+  llvm::BasicBlock *BB = &F->getEntryBlock();
+  llvm::SmallPtrSet<llvm::BasicBlock *, 8> visited;
+
+  while (BB) {
+    if (!visited.insert(BB).second)
+      return nullptr;
+
+    for (auto &I : *BB) {
+      if (llvm::isa<llvm::AllocaInst>(&I)) {
+        env[&I] = nullptr;
+        continue;
+      }
+
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        auto *ptr = SI->getPointerOperand()->stripPointerCasts();
+        if (!llvm::isa<llvm::AllocaInst>(ptr))
+          return nullptr;
+        auto *val = captureValue(SI->getValueOperand(), env, ctx);
+        if (!val)
+          return nullptr;
+        env[ptr] = val;
+        continue;
+      }
+
+      if (auto *BI = llvm::dyn_cast<llvm::BranchInst>(&I)) {
+        if (!BI->isUnconditional())
+          return nullptr;
+        BB = BI->getSuccessor(0);
+        goto next_eval_block;
+      }
+
+      if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+        if (!RI->getReturnValue())
+          return nullptr;
+        return captureValue(RI->getReturnValue(), env, ctx);
+      }
+    }
+
+    return nullptr;
+  next_eval_block:;
+  }
+
+  return nullptr;
+}
+
+llvm::Constant *captureGlobalValue(llvm::GlobalVariable *GV, GlobalCaptureContext &ctx) {
+  if (!GV)
+    return nullptr;
+
+  auto it = ctx.cache.find(GV);
+  if (it != ctx.cache.end())
+    return it->second;
+  if (ctx.visiting.count(GV))
+    return nullptr;
+
+  llvm::StoreInst *store = nullptr;
+  auto storeIt = ctx.initStores.find(GV);
+  if (storeIt != ctx.initStores.end()) {
+    store = storeIt->second;
+  } else if (ctx.main) {
+    store = findUniqueGlobalInitStore(ctx.main, GV);
+    ctx.initStores[GV] = store;
+  }
+
+  if (!store) {
+    auto *init = GV->getInitializer();
+    if (init) {
+      ctx.cache[GV] = init;
+      return init;
+    }
+    return nullptr;
+  }
+
+  ctx.visiting.insert(GV);
+  LocalEnv env;
+  if (!buildLocalEnvUntil(store->getFunction(), store, env, ctx)) {
+    ctx.visiting.erase(GV);
+    return nullptr;
+  }
+
+  auto *captured = captureValue(store->getValueOperand(), env, ctx);
+  ctx.visiting.erase(GV);
+  if (!captured)
+    return nullptr;
+
+  ctx.cache[GV] = captured;
+  return captured;
+}
+
+llvm::Constant *captureValue(llvm::Value *V, LocalEnv &env, GlobalCaptureContext &ctx) {
+  if (!V)
+    return nullptr;
+
+  if (auto *C = llvm::dyn_cast<llvm::Constant>(V)) {
+    if (auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(C))
+      return captureGlobalValue(GV, ctx);
+    return C;
+  }
+
+  if (auto it = env.find(V); it != env.end())
+    return it->second;
+
+  if (auto *arg = llvm::dyn_cast<llvm::Argument>(V)) {
+    auto it = env.find(arg);
+    return it != env.end() ? it->second : nullptr;
+  }
+
+  if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(V)) {
+    auto *ptr = LI->getPointerOperand()->stripPointerCasts();
+    if (auto it = env.find(ptr); it != env.end())
+      return it->second;
+    if (auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(ptr))
+      return captureGlobalValue(GV, ctx);
+    return nullptr;
+  }
+
+  if (auto *Cast = llvm::dyn_cast<llvm::CastInst>(V)) {
+    auto *op = captureValue(Cast->getOperand(0), env, ctx);
+    if (!op)
+      return nullptr;
+    return llvm::ConstantExpr::getCast(Cast->getOpcode(), op, Cast->getType());
+  }
+
+  if (auto *Bin = llvm::dyn_cast<llvm::BinaryOperator>(V)) {
+    auto *lhs = captureValue(Bin->getOperand(0), env, ctx);
+    auto *rhs = captureValue(Bin->getOperand(1), env, ctx);
+    if (!lhs || !rhs)
+      return nullptr;
+    return llvm::ConstantExpr::get(Bin->getOpcode(), lhs, rhs);
+  }
+
+  if (auto *Sel = llvm::dyn_cast<llvm::SelectInst>(V)) {
+    auto *cond = captureValue(Sel->getCondition(), env, ctx);
+    auto *t = captureValue(Sel->getTrueValue(), env, ctx);
+    auto *f = captureValue(Sel->getFalseValue(), env, ctx);
+    if (!cond || !t || !f)
+      return nullptr;
+    auto *condInt = llvm::dyn_cast<llvm::ConstantInt>(cond);
+    if (!condInt)
+      return nullptr;
+    return condInt->isZero() ? f : t;
+  }
+
+  if (auto *CI = llvm::dyn_cast<llvm::CallInst>(V)) {
+    auto *callee = CI->getCalledFunction();
+    if (!callee)
+      return nullptr;
+    std::vector<llvm::Constant *> args;
+    args.reserve(CI->arg_size());
+    for (auto &arg : CI->args()) {
+      auto *captured = captureValue(arg.get(), env, ctx);
+      if (!captured)
+        return nullptr;
+      args.push_back(captured);
+    }
+    return captureFunctionReturn(callee, args, ctx);
+  }
+
+  return nullptr;
+}
+
+void captureKernelVisibleGlobals(llvm::Module *M,
+                                 const std::vector<llvm::GlobalValue *> &keep) {
+  auto *main = findTopLevelMain(M);
+  if (!main)
+    return;
+
+  GlobalCaptureContext ctx;
+  ctx.main = main;
+  for (auto *G : keep) {
+    auto *F = llvm::dyn_cast<llvm::Function>(G);
+    if (!F || F->isDeclaration())
+      continue;
+
+    llvm::SmallVector<llvm::Instruction *, 8> loadsToReplace;
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I);
+        if (!LI)
+          continue;
+        auto *ptr = LI->getPointerOperand()->stripPointerCasts();
+        if (auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(ptr)) {
+          if (GV->isDeclaration())
+            continue;
+          if (captureGlobalValue(GV, ctx))
+            loadsToReplace.push_back(LI);
+        }
+      }
+    }
+
+    for (auto *I : loadsToReplace) {
+      auto *LI = llvm::cast<llvm::LoadInst>(I);
+      auto *GV =
+          llvm::cast<llvm::GlobalVariable>(LI->getPointerOperand()->stripPointerCasts());
+      auto *captured = captureGlobalValue(GV, ctx);
+      if (!captured)
+        continue;
+      llvm::Constant *replacement = captured;
+      if (captured->getType() != LI->getType())
+        replacement =
+            llvm::ConstantExpr::getCast(llvm::Instruction::BitCast, captured, LI->getType());
+      LI->replaceAllUsesWith(replacement);
+      LI->eraseFromParent();
+    }
+  }
+}
+
 std::vector<llvm::GlobalValue *>
 getRequiredGVs(const std::vector<llvm::GlobalValue *> &kernels) {
   llvm::SmallPtrSet<llvm::GlobalValue *, 32> keep;
@@ -723,6 +1029,8 @@ std::string moduleToPTX(llvm::Module *M, std::vector<llvm::GlobalValue *> &kerne
 
   M->setDataLayout(machine->createDataLayout());
   auto keep = getRequiredGVs(kernels);
+  captureKernelVisibleGlobals(M, keep);
+  keep = getRequiredGVs(kernels);
 
   auto prune = [&](std::vector<llvm::GlobalValue *> keep) {
     llvm::LoopAnalysisManager lam;
