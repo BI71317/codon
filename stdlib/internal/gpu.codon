@@ -961,3 +961,32 @@ def _gpu_loop_outline_template(start, stop, args, instance: Literal[int]):
 
     _kernel_stub(start, n, args, grid=grid, block=block)
 
+
+from numpy import ndarray
+
+class DeviceNDArray[dtype: type, ndim: Literal[int]]:
+    _gpu_obj: ndarray[dtype, ndim]
+    _cache: AllocCache
+
+    # obj ndarray must be in Host Side.
+    def __new__(obj: ndarray[dtype, ndim]):
+        _self_cache = AllocCache([])
+        _self_gpu_obj = obj.__to_gpu__(_self_cache)
+        return DeviceNDArray[dtype, ndim](_gpu_obj = _self_gpu_obj, _cache=_self_cache)
+    
+    def __to_gpu__(self, cache: AllocCache) -> ndarray[dtype, ndim]:
+        return self._gpu_obj
+
+    def __from_gpu__(self, other: ndarray[dtype, ndim]):
+        pass 
+    
+    def __del__(self):
+        self._cache.free()
+
+def to_device(obj: ndarray[dtype, ndim], dtype: type, ndim: Literal[int]) -> DeviceNDArray[dtype, ndim]:
+    return DeviceNDArray[dtype, ndim].__new__(obj)
+
+def copy_to_host(other: DeviceNDArray[dtype, ndim], dtype: type, ndim: Literal[int]) -> ndarray[dtype, ndim]:
+    return ndarray[dtype, ndim].__from_gpu_new__(other._gpu_obj)
+
+    
