@@ -19,6 +19,7 @@ modules: List[CUmodule] = []
 
 # We use 3020 (v2; 64-bit address space) CUDA API here
 cuCtxCreate = Function[[Ptr[cobj], u32, CUdevice], CUresult](cobj())
+cuCtxSynchronize = Function[[], CUresult](cobj())
 cuMemAlloc = Function[[Ptr[CUdeviceptr], i64], CUresult](cobj())
 cuMemcpyDtoH = Function[[cobj, CUdeviceptr, u64], CUresult](cobj())
 cuMemcpyHtoD = Function[[CUdeviceptr, cobj, u64], CUresult](cobj())
@@ -81,6 +82,7 @@ _CUDA_INITIALIZED = False
 
 def cuda_init_handles(cuda_handle: cobj):
     global cuCtxCreate
+    global cuCtxSynchronize
     global cuDeviceComputeCapability
     global cuDeviceGet
     global cuDeviceGetCount
@@ -97,6 +99,7 @@ def cuda_init_handles(cuda_handle: cobj):
     global cuModuleLoadData
 
     cuCtxCreate = dlsym(cuda_handle, "cuCtxCreate_v2")
+    cuCtxSynchronize = dlsym(cuda_handle, "cuCtxSynchronize")
     cuMemAlloc = dlsym(cuda_handle, "cuMemAlloc_v2")
     cuMemcpyDtoH = dlsym(cuda_handle, "cuMemcpyDtoH_v2")
     cuMemcpyHtoD = dlsym(cuda_handle, "cuMemcpyHtoD_v2")
@@ -987,3 +990,6 @@ def to_device(obj: ndarray[dtype, ndim], dtype: type, ndim: Literal[int]) -> Dev
 
 def copy_to_host(other: DeviceNDArray[dtype, ndim], dtype: type, ndim: Literal[int]) -> ndarray[dtype, ndim]:
     return ndarray[dtype, ndim].__from_gpu_new__(other._gpu_obj)
+
+def synchronize():
+    cuda_check(cuCtxSynchronize())
