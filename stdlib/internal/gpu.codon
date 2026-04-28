@@ -991,5 +991,9 @@ def to_device(obj: ndarray[dtype, ndim], dtype: type, ndim: Literal[int]) -> Dev
 def copy_to_host(other: DeviceNDArray[dtype, ndim], dtype: type, ndim: Literal[int]) -> ndarray[dtype, ndim]:
     return ndarray[dtype, ndim].__from_gpu_new__(other._gpu_obj)
 
+def free_device(other: DeviceNDArray[dtype, ndim], dtype: type, ndim: Literal[int]):
+    other._cache.free()
+    other._cache = AllocCache([])
+
 def synchronize():
     cuda_check(cuCtxSynchronize())
