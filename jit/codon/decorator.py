@@ -174,14 +174,14 @@ class RewriteFunctionArgs(ast.NodeTransformer):
 
 def _obj_to_str(obj, **kwargs) -> str:
     if inspect.isclass(obj):
-        lines = inspect.getsourcelines(obj)[0]
+        lines = inspect.getsource(obj).splitlines(True)
         extra_spaces = lines[0].find("class")
         obj_str = "".join(l[extra_spaces:] for l in lines)
         obj_name = obj.__name__
     elif callable(obj) or isinstance(obj, str):
         is_str = isinstance(obj, str)
         lines = [i + '\n' for i in obj.split('\n')
-                 ] if is_str else inspect.getsourcelines(obj)[0]
+                 ] if is_str else inspect.getsource(obj).splitlines(True)
         if not is_str:
             lines = lines[1:]
         obj_str = textwrap.dedent(''.join(lines))
