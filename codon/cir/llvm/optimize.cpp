@@ -20,8 +20,11 @@ getTargetMachine(llvm::Triple triple, llvm::StringRef cpuStr,
                  llvm::StringRef featuresStr, const llvm::TargetOptions &options,
                  bool pic) {
   std::string err;
+  auto march = llvm::codegen::getMArch();
+  if (march == "native")
+    march.clear();
   const llvm::Target *target =
-      llvm::TargetRegistry::lookupTarget(llvm::codegen::getMArch(), triple, err);
+      llvm::TargetRegistry::lookupTarget(march, triple, err);
 
   if (!target)
     return nullptr;

@@ -239,7 +239,10 @@ llvm::Function *LLVMVisitor::getFunc(const Func *func) {
 std::unique_ptr<llvm::Module> LLVMVisitor::makeModule(llvm::LLVMContext &context,
                                                       const SrcInfo *src) {
   auto builder = llvm::EngineBuilder();
-  builder.setMArch(llvm::codegen::getMArch());
+  auto march = llvm::codegen::getMArch();
+  if (march == "native")
+    march.clear();
+  builder.setMArch(march);
   builder.setMCPU(llvm::codegen::getCPUStr());
   builder.setMAttrs(llvm::codegen::getFeatureList());
 
